@@ -1,10 +1,13 @@
 #! /usr/bin/env python
+from __future__ import print_function
+
 import base64
 import hashlib
 import hmac
 import os
 import sys
 import re
+import time
 from datetime import datetime, timedelta
 
 try:
@@ -40,11 +43,16 @@ if sys.version_info >= (3, 5):
     except ImportError:
         pass
 
+
+TIMEOUT = 10
 PAGE_SIZE = 500
+POLL_INTERVAL = 2.0
+EXPIRATION = timedelta(minutes=10)
 EXPIRES_FORMAT = "%Y-%m-%dT%H:%M:%S%z"
 
 REQUIRED_CONFIG_KEYS = {"endpoint", "key", "secret", "method", "timeout"}
-ALLOWED_CONFIG_KEYS = {"verify", "cert", "retry", "theme", "expiration"}
+ALLOWED_CONFIG_KEYS = {"verify", "cert", "retry", "theme", "expiration",
+                       "poll_interval", "trace"}
 DEFAULT_CONFIG = {
     "timeout": 10,
     "method": "get",
@@ -53,7 +61,13 @@ DEFAULT_CONFIG = {
     "cert": None,
     "name": None,
     "expiration": 600,
+    "poll_interval": POLL_INTERVAL,
+    "trace": None,
 }
+
+PENDING = 0
+SUCCESS = 1
+FAILURE = 2
 
 
 def cs_encode(s):
@@ -109,17 +123,17 @@ def transform(params):
 
 
 class CloudStackException(Exception):
-    pass
-
-
-class Unauthorized(CloudStackException):
-    pass
+    """Exception nicely wrapping a request response."""
+    def __init__(self, message, response, *args, **kwargs):
+        super(CloudStackException, self).__init__(message, *args, **kwargs)
+        self.response = response
 
 
 class CloudStack(object):
     def __init__(self, endpoint, key, secret, timeout=10, method='get',
                  verify=True, cert=None, name=None, retry=0,
-                 expiration=timedelta(minutes=10)):
+                 job_timeout=None, poll_interval=POLL_INTERVAL,
+                 expiration=timedelta(minutes=10), trace=False):
         self.endpoint = endpoint
         self.key = key
         self.secret = secret
@@ -129,9 +143,12 @@ class CloudStack(object):
         self.cert = cert
         self.name = name
         self.retry = int(retry)
+        self.job_timeout = int(job_timeout) if job_timeout else 0
+        self.poll_interval = float(poll_interval)
         if not hasattr(expiration, "seconds"):
             expiration = timedelta(seconds=int(expiration))
         self.expiration = expiration
+        self.trace = bool(trace)
 
     def __repr__(self):
         return '<CloudStack: {0}>'.format(self.name or self.endpoint)
@@ -141,8 +158,8 @@ class CloudStack(object):
             return self._request(command, **kwargs)
         return handler
 
-    def _prepare_request(self, command, json, opcode_name, fetch_list,
-                         **kwargs):
+    def _prepare_request(self, command, json=True, opcode_name='command',
+                         fetch_list=False, **kwargs):
         params = CaseInsensitiveDict(**kwargs)
         params.update({
             'apiKey': self.key,
@@ -163,6 +180,7 @@ class CloudStack(object):
 
     def _request(self, command, json=True, opcode_name='command',
                  fetch_list=False, headers=None, **params):
+        fetch_result = params.pop('fetch_result', False)
         kind, params = self._prepare_request(command, json, opcode_name,
                                              fetch_list, **params)
 
@@ -178,13 +196,27 @@ class CloudStack(object):
             params.pop('signature', None)
             params['signature'] = self._sign(params)
 
+            req = requests.Request(self.method,
+                                   self.endpoint,
+                                   headers=headers,
+                                   **{kind: params})
+            prepped = req.prepare()
+            if self.trace:
+                print(prepped.method, prepped.url, file=sys.stderr)
+                if prepped.headers:
+                    print(prepped.headers, "\n", file=sys.stderr)
+                if prepped.body:
+                    print(prepped.body, file=sys.stderr)
+                else:
+                    print(file=sys.stderr)
+
             try:
-                response = getattr(requests, self.method)(self.endpoint,
-                                                          headers=headers,
-                                                          timeout=self.timeout,
-                                                          verify=self.verify,
-                                                          cert=self.cert,
-                                                          **{kind: params})
+                with requests.Session() as session:
+                    response = session.send(prepped,
+                                            timeout=self.timeout,
+                                            verify=self.verify,
+                                            cert=self.cert)
+
             except requests.exceptions.ConnectionError:
                 max_retry -= 1
                 if (
@@ -195,20 +227,15 @@ class CloudStack(object):
                 continue
             max_retry = self.retry
 
-            try:
-                data = response.json()
-            except ValueError as e:
-                msg = "Make sure endpoint URL '%s' is correct." % self.endpoint
-                raise CloudStackException(
-                    "HTTP {0} response from CloudStack".format(
-                        response.status_code), response, "%s. " % str(e) + msg)
+            if self.trace:
+                print(response.status_code, response.reason, file=sys.stderr)
+                headers = "\n".join("{}: {}".format(k, v)
+                                    for k, v in response.headers.items())
+                print(headers, "\n", file=sys.stderr)
+                print(response.text, "\n", file=sys.stderr)
 
-            [key] = data.keys()
-            data = data[key]
-            if response.status_code != 200:
-                raise CloudStackException(
-                    "HTTP {0} response from CloudStack".format(
-                        response.status_code), response, data)
+            data = self._response_value(response, json)
+
             if fetch_list:
                 try:
                     [key] = [k for k in data.keys() if k != 'count']
@@ -219,10 +246,110 @@ class CloudStack(object):
                     page += 1
                     if len(final_data) >= data.get('count', PAGE_SIZE):
                         done = True
+            elif fetch_result and 'jobid' in data:
+                final_data = self._jobresult(jobid=data['jobid'],
+                                             headers=headers)
+                done = True
             else:
                 final_data = data
                 done = True
         return final_data
+
+    def _response_value(self, response, json=True):
+        """Parses the HTTP response as a the cloudstack value.
+
+        It throws an exception if the server didn't answer with a 200.
+        """
+        if json:
+            contentType = response.headers.get("Content-Type", "")
+            if not contentType.startswith("application/json"):
+                raise CloudStackException(
+                    "JSON (application/json) was expected, got {!r}"
+                    .format(contentType),
+                    response)
+
+            try:
+                data = response.json()
+            except ValueError as e:
+                msg = "Make sure endpoint URL '%s' is correct." % self.endpoint
+                raise CloudStackException(
+                    "HTTP {0} response from CloudStack"
+                    .format(response.status_code),
+                    response,
+                    "%s. " % str(e) + msg,)
+
+            [key] = data.keys()
+            data = data[key]
+        else:
+            data = response.text
+
+        if response.status_code != 200:
+            raise CloudStackException(
+                "HTTP {0} response from CloudStack".format(
+                    response.status_code),
+                response,
+                data)
+
+        return data
+
+    def _jobresult(self, jobid, json=True, headers=None):
+        """Poll the async job result.
+
+        To be run via in a Thread, the result is put within
+        the result list which is a hack.
+        """
+        failures = 0
+
+        total_time = self.job_timeout or 2**30
+        remaining = timedelta(seconds=total_time)
+        endtime = datetime.now() + remaining
+
+        while remaining.total_seconds() > 0:
+            timeout = max(min(self.timeout, remaining.total_seconds()), 1)
+            try:
+                kind, params = self._prepare_request('queryAsyncJobResult',
+                                                     jobid=jobid)
+
+                transform(params)
+                params['signature'] = self._sign(params)
+
+                response = getattr(requests, self.method)(self.endpoint,
+                                                          headers=headers,
+                                                          timeout=timeout,
+                                                          verify=self.verify,
+                                                          cert=self.cert,
+                                                          **{kind: params})
+
+                j = self._response_value(response, json)
+
+                failures = 0
+                if j['jobstatus'] != PENDING:
+                    if j['jobresultcode'] or j['jobstatus'] != SUCCESS:
+                        raise CloudStackException("Job failure", response)
+
+                    if 'jobresult' not in j:
+                        raise CloudStackException("Unknown job result",
+                                                  response)
+
+                    return j['jobresult']
+
+            except CloudStackException:
+                raise
+
+            except Exception as e:
+                failures += 1
+                if failures > 10:
+                    raise e
+
+            time.sleep(self.poll_interval)
+            remaining = endtime - datetime.now()
+
+        if response:
+            response.status_code = 408
+
+        raise CloudStackException("Timeout waiting for async job result",
+                                  response,
+                                  jobid)
 
     def _sign(self, data):
         """
